@@ -10,7 +10,25 @@ const PORT = process.env.PORT || 3000;
 const SITE = path.resolve(process.env.SITE_DIR || path.join(__dirname, '..'));
 const HAS_SITE = fs.existsSync(path.join(SITE, 'index.html')); // sem site ao lado, só roda o multiplayer
 const ALLOWED = (process.env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
-const MAX_PEERS = 40, MAX_MSG = 700, MIN_GAP_MS = 60;
+const MAX_PEERS = 40;
+const MAX_PRESENCE = 24000;   // presença (posição, roupa, chat, nome...)
+const MAX_EVENT = 130000;     // eventos (voz, skin, construções, golpes)
+const MAX_MSG = MAX_EVENT;    // limite duro do WebSocket
+const MIN_GAP_MS = 60;
+// Eventos: { t:'e', k:<tipo>, d:<dados>, to?:<id do jogador> }
+//   vs   voz ao vivo (pedacos de audio) -> todos     (ate ~40 por segundo)
+//   vz   voz (clipe curto, antigo)   -> todos        (max 1 a cada 700 ms)
+//   skin skin importada (PNG base64) -> todos, guardada para quem entrar depois
+//   ob   construções do jogador      -> todos, guardada para quem entrar depois
+//   hit  golpe/flecha em jogador     -> só o alvo (to), dano limitado
+const EVENT_RULES = {
+  vz:   { gap: 700,  sticky: false, dm: false },
+  vs:   { gap: 0, max: 60, sticky: false, dm: false },   // voz ao vivo: pedacos de ~80 ms (ate 60 por segundo)
+  skin: { gap: 1500, sticky: true,  dm: false },
+  ob:   { gap: 800,  sticky: true,  dm: false },
+  hit:  { gap: 120,  sticky: false, dm: true  },
+  ko:   { gap: 1000, sticky: false, dm: false }
+};
 
 const MIME = {
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css',
@@ -70,11 +88,16 @@ function join(ws, name) {
   let room = rooms.get(name);
   if (!room) { room = new Map(); rooms.set(name, room); }
   const id = Math.random().toString(36).slice(2, 10);
-  const st = { id, p: null, at: 0 };
+  const st = { id, p: null, at: 0, ev: {}, sticky: {} };
   const peers = [];
   for (const a of room.values()) if (a.p) peers.push({ peer: a.id, presence: a.p });
   room.set(ws, st);
   ws.send(JSON.stringify({ t: 'init', me: id, peers }));
+  // quem entra agora recebe a skin e as construções que os outros já publicaram
+  for (const a of room.values()) {
+    if (a === st) continue;
+    for (const k in a.sticky) { try { ws.send(a.sticky[k]); } catch {} }
+  }
 
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
@@ -83,9 +106,44 @@ function join(ws, name) {
     const msg = buf.toString();
     if (msg.length > MAX_MSG) return;
     const now = Date.now();
-    if (now - st.at < MIN_GAP_MS) return;
     let m; try { m = JSON.parse(msg); } catch { return; }
-    if (!m || m.t !== 'p' || typeof m.d !== 'object' || m.d === null || Array.isArray(m.d)) return;
+    if (!m || typeof m !== 'object') return;
+
+    // ---- eventos (voz, skin, construções, golpes) ----
+    if (m.t === 'e') {
+      const rule = EVENT_RULES[m.k];
+      if (!rule || typeof m.d !== 'object' || m.d === null || Array.isArray(m.d)) return;
+      if (rule.max) {            // limite por segundo (aceita rajadas curtas)
+        const w = st.win || (st.win = {});
+        const b = w[m.k] || (w[m.k] = { t: now, n: 0 });
+        if (now - b.t >= 1000) { b.t = now; b.n = 0; }
+        if (++b.n > rule.max) return;
+      } else {
+        if (now - (st.ev[m.k] || 0) < rule.gap) return;
+        st.ev[m.k] = now;
+      }
+      if (m.k === 'vs' && (typeof m.d.d !== 'string' || m.d.d.length > 12000)) return;
+      if (m.k === 'hit') {
+        let dmg = Number(m.d.dmg);
+        if (!Number.isFinite(dmg)) return;
+        m.d = { dmg: Math.max(1, Math.min(60, Math.round(dmg))), w: m.d.w === 'a' ? 'a' : 'm' };
+      }
+      if (m.k === 'ko') m.d = { by: typeof m.d.by === 'string' ? m.d.by.slice(0, 16) : '' };
+      const out = JSON.stringify({ t: 'e', k: m.k, peer: id, d: m.d });
+      if (rule.dm) {            // mensagem direta: só o alvo, e só se estiver na mesma sala
+        const to = String(m.to || '');
+        for (const [w, a] of room) if (a.id === to && w.readyState === 1) { try { w.send(out); } catch {} }
+        return;
+      }
+      if (rule.sticky) st.sticky[m.k] = out;
+      broadcast(room, ws, JSON.parse(out));
+      return;
+    }
+
+    // ---- presença ----
+    if (msg.length > MAX_PRESENCE) return;
+    if (now - st.at < MIN_GAP_MS) return;
+    if (m.t !== 'p' || typeof m.d !== 'object' || m.d === null || Array.isArray(m.d)) return;
     const first = st.p === null;
     st.p = m.d; st.at = now;
     broadcast(room, ws, { t: first ? 'join' : 'p', peer: id, presence: m.d, d: m.d });
